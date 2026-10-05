@@ -473,6 +473,79 @@ def label_for(start, end):
 # --------------------------------------------------------------------------
 # Extraction
 # --------------------------------------------------------------------------
+def _norm_header(text):
+    """A comparable key for a column heading.
+
+    Bracketed annotations are dropped because Swiggy writes the same column in
+    several ways - 'Total Swiggy Fees [incl. GST on fees]' in older annexures,
+    'Total Swiggy Fees [6+7+8-9+...]' in the ones here - while
+    'GST Deduction [Sec 9(5)]' appears elsewhere as just 'GST Deduction'.
+    """
+    low = str(text or "").lower().replace("&", " and ")
+    low = re.sub(r"[\(\[].*?[\)\]]", " ", low, flags=re.S)
+    return re.sub(r"[^a-z0-9]", "", low)
+
+
+# columns the reports cannot do without; anything else may be missing
+REQUIRED_ORDER_COLS = [
+    "Order ID", "Order Date", "Order Status", "Cancelled By?", "Item Total",
+    "Packaging Charges", "Restaurant Discount Share [3a+3b]",
+    "Net Bill Value (before taxes) [1+2-3]", "GST Collected",
+    "Total Customer Paid [4+5]", "Commission", "Payment Collection Charges",
+    "GST on Service Fee @18%", "Total Swiggy Fees [incl. GST on fees]",
+    "Complaint & Cancellation Charges [18+19]", "GST Deduction [Sec 9(5)]",
+    "TCS", "TDS", "Net Payout for Order (after taxes)",
+]
+
+
+def map_order_columns(ws):
+    """Locate the Order Level header row and map each expected column to its position.
+
+    Swiggy has been known to insert or rename columns between annexures; reading
+    by header name rather than by a fixed position keeps older and newer files
+    working. Returns (header_row, {column name: index}, missing required names).
+    """
+    def matches(key, want):
+        """Header keys carry formula suffixes ('... [A-B-C-D]') or drop brackets."""
+        if key == want:
+            return True
+        if key.startswith(want):
+            rest = key[len(want):]
+            return bool(rest) and (rest.isdigit() or len(rest) <= 6)
+        if want.startswith(key):
+            return len(want) - len(key) <= 6
+        return False
+
+    expected = {_norm_header(name): name for name in ORDER_COLS.values()}
+    header_row = None
+    mapping = {}
+    for row in ws.iter_rows(min_row=1, max_row=12):
+        texts = {_norm_header(c.value): c.column for c in row if c.value is not None}
+        if _norm_header("Order ID") in texts and len(set(texts) & set(expected)) >= 8:
+            header_row = row[0].row
+            # exact (annotation-stripped) names first, then the longest near-match
+            for key, col in texts.items():
+                if key in expected and expected[key] not in mapping:
+                    mapping[expected[key]] = col
+            used = set(mapping.values())
+            for key, col in sorted(texts.items(), key=lambda kv: -len(kv[0])):
+                if col in used:
+                    continue
+                candidates = [want for want in expected if want not in mapping and matches(key, want)]
+                if not candidates:
+                    continue
+                best = max(candidates, key=len)
+                mapping[expected[best]] = col
+                used.add(col)
+            break
+    missing = [name for name in REQUIRED_ORDER_COLS if name not in mapping]
+    if header_row is None:
+        # no recognisable header - fall back to the historic fixed positions
+        mapping = dict(ORDER_COLS)
+        header_row = 3
+    return header_row, mapping, missing
+
+
 def read_annexure(path):
     wb = openpyxl.load_workbook(path, data_only=True)
     rec = {"file": os.path.basename(path), "path": path}
@@ -527,13 +600,19 @@ def read_annexure(path):
     ws = find_sheet(wb, "Order Level", "Order level breakup")
     if ws is None:
         raise ValueError("no 'Order Level' sheet")
+    header_row, col_map, missing = map_order_columns(ws)
+    if missing:
+        raise ValueError("Order Level sheet is missing column(s): " + ", ".join(missing[:4]) +
+                         (" ..." if len(missing) > 4 else ""))
+    rec["order_columns"] = col_map
     orders = []
-    for row in ws.iter_rows(min_row=4):
+    for row in ws.iter_rows(min_row=header_row + 1):
         if row[0].value is None or str(row[0].value).strip() == "":
             continue
         order = {}
-        for idx, name in ORDER_COLS.items():
-            order[name] = row[idx - 1].value
+        for name in ORDER_COLS.values():
+            idx = col_map.get(name)
+            order[name] = row[idx - 1].value if idx and idx <= len(row) else None
         if isinstance(order["Order Date"], datetime):
             order["_order_dt"] = order["Order Date"]
         else:
@@ -669,9 +748,24 @@ def expand_inputs(items, folder=None):
     return unique
 
 
+def annexure_signature(rec):
+    """Identity of the data in an annexure: outlet, period, the orders and the payout.
+
+    Two files with the same signature carry the same data (for example the same
+    annexure kept in two folders), so only one of them may be counted.
+    """
+    ids = tuple(sorted(str(o.get("Order ID")) for o in rec["orders"]))
+    return (str(rec.get("gstin") or rec.get("rest_id") or ""),
+            str(rec.get("label")),
+            int(rec.get("orders_total") or len(rec["orders"])),
+            r2(rec.get("net_payout") or 0),
+            ids)
+
+
 def load_files(paths, gst_rate=None):
     """Read the given annexures. Invalid files are reported, not fatal."""
     records, skipped = [], []
+    seen_signatures = {}
     for path in paths:
         ok, why = looks_like_annexure(path)
         if not ok:
@@ -693,6 +787,13 @@ def load_files(paths, gst_rate=None):
         rec["start"], rec["end"], rec["label"] = sd, ed, label
         rec["sort_key"] = sd or datetime(year, 1, 1)
         rec["year"] = year
+        rec["path"] = path
+        signature = annexure_signature(rec)
+        if signature in seen_signatures:
+            skipped.append((path, "duplicate - same outlet, period and orders as {}; read once "
+                                  "only".format(display_path(seen_signatures[signature], 44))))
+            continue
+        seen_signatures[signature] = path
         records.append(rec)
     records.sort(key=lambda r: r["sort_key"])
     return records, skipped
@@ -2774,7 +2875,31 @@ def _panel(title, lines=None, width=88):
 
 def _short(path, limit=46):
     name = os.path.basename(path)
-    return name if len(name) <= limit else name[:limit - 3] + "..."
+    if len(name) <= limit:
+        return name
+    return name[:limit - 3].rstrip(" ._-") + "..."
+
+
+def _short_label(label, limit=46):
+    """Like _short(), but keeps the folder when the label has one."""
+    name = os.path.basename(label)
+    folder = os.path.dirname(label)
+    if not folder:
+        return name if len(name) <= limit else name[:limit - 3] + "..."
+    room = max(14, limit - len(folder) - 4)
+    short = name if len(name) <= room else name[:room - 3].rstrip(" ._-") + "..."
+    return folder + "/" + short
+
+
+def display_path(path, limit=46):
+    """Path as the user would type it: relative when inside the current folder."""
+    try:
+        rel = os.path.relpath(path)
+    except ValueError:  # different drive on Windows
+        rel = path
+    if rel.startswith(".."):
+        rel = os.path.basename(path)
+    return _short_label(rel, limit)
 
 
 def describe_files(paths):
@@ -2803,6 +2928,29 @@ def describe_files(paths):
                      "rest_id": identity["rest_id"], "gstin": identity["gstin"],
                      "period": period, "orders": orders if orders is not None else "",
                      "payout": payout})
+    # mark files that carry the same data as an earlier one (e.g. the same
+    # annexure kept in two folders) so they are not read twice
+    seen, counts = {}, {}
+    for row in rows:
+        row["label"] = os.path.basename(row["path"])
+        counts[row["label"]] = counts.get(row["label"], 0) + 1
+    for i, row in enumerate(rows, start=1):
+        row["dup_of"] = None
+        if not row["ok"]:
+            continue
+        signature = (row["gstin"], row["period"].strip().lower(), str(row["orders"]),
+                     r2(row["payout"] or 0))
+        if signature in seen:
+            row["dup_of"] = seen[signature]
+        else:
+            seen[signature] = i
+    for row in rows:
+        # when two folders hold files of the same name, show the folder too
+        if counts.get(row["label"], 0) > 1:
+            try:
+                row["label"] = os.path.relpath(row["path"])
+            except ValueError:  # different drive on Windows
+                row["label"] = row["path"]
     return rows
 
 
@@ -2812,13 +2960,16 @@ def print_file_table(rows):
         "#", "File", "Restaurant (ID)", "Payout period", "Orders", "Payout (Rs)", w=48))
     print("  " + "-" * 124)
     for i, row in enumerate(rows, start=1):
+        label = _short_label(row.get("label") or row["path"])
         if not row["ok"]:
             print("  {:<4}{:<{w}}{:<28}{:<22}{:>8}{:>14}".format(
-                i, _short(row["path"]), "-- not an annexure --", row["why"][:22], "", "", w=48))
+                i, label, "-- not an annexure --", row["why"][:22], "", "", w=48))
             continue
         rest = "{} ({})".format(row["restaurant"] or "?", row["rest_id"] or "?")
+        if row.get("dup_of"):
+            rest = "duplicate of #{}".format(row["dup_of"])
         print("  {:<4}{:<{w}}{:<28}{:<22}{:>8}{:>14}".format(
-            i, _short(row["path"]), rest[:27], row["period"][:21], str(row["orders"]),
+            i, label, rest[:27], row["period"][:21], str(row["orders"]),
             "{:,.2f}".format(row["payout"]) if row["payout"] else "", w=48))
 
 
@@ -2935,7 +3086,11 @@ def main(argv=None):
         _panel("Annexures found in {}".format(folder))
         print_file_table(rows)
         valid = [r for r in rows if r["ok"]]
-        print("\n  {} file(s), {} usable annexure(s).".format(len(rows), len(valid)))
+        dups = [r for r in valid if r.get("dup_of")]
+        summary = "\n  {} file(s), {} usable annexure(s).".format(len(rows), len(valid))
+        if dups:
+            summary += " {} duplicate(s) will be read once.".format(len(dups))
+        print(summary)
         return 0
     else:
         paths, folder = choose_files_interactive(folder, skip=os.path.basename(os.path.abspath(outdir)))
@@ -2951,7 +3106,7 @@ def main(argv=None):
     # ---- read ------------------------------------------------------------
     records, skipped = load_files(paths, gst_rate)
     for path, why in skipped:
-        print("  skipped {} - {}".format(_short(path, 60), why))
+        print("  skipped {} - {}".format(display_path(path, 60), why))
     if not records:
         print("\nNo readable Swiggy payout annexures in the selection.")
         return 1

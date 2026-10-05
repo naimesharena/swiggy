@@ -174,11 +174,23 @@ from the annexure data (falling back to 5%). Nothing else is assumed.
   `reports/index.txt` listing what was produced where.
 - The GSTIN's state code drives the state name and place of supply on every sheet (Gujarat 24, Maharashtra 27 …),
   so an outlet in another state is labelled correctly without any code change.
+- The Order Level sheet is read by **column heading**, not by column position, so a client file with an extra
+  column inserted, a column renamed, or an optional column missing still reads correctly. If a column the
+  reports genuinely need is absent, the file is reported as skipped with the column names listed instead of
+  producing wrong figures.
+- The same annexure kept in two folders (for example `creamy/` and the project root) is detected as a
+  duplicate and read **once**, so totals are never double-counted. Duplicates are shown in the file list as
+  `duplicate of #N`, and reported when the run starts.
 - A file that cannot be read is reported (with the missing sheets) and skipped; the other restaurants are
   still processed.
 
-Inputs are always read **by column and label, never by fixed row**, so Swiggy can change the annexure layout
-slightly without breaking anything.
+Inputs are always read **by column and label, never by fixed row**, and the Order Level columns are matched
+by heading, so Swiggy can change the annexure layout slightly (or a client can be on a newer template) without
+breaking anything.
+
+> **Keeping one copy of each annexure.** If the same weekly file is stored twice, put both copies in the
+> selection and the tool will read one and say which file it treated as the duplicate. Removing one of the
+> two copies keeps the folder tidy, but it is not necessary.
 
 > Food delivery through Swiggy is a local (intra-state) supply, so the tax is split CGST/SGST on the restaurant's
 > own state code. The annexures do not carry the customer's delivery state; if you ever need IGST treatment for

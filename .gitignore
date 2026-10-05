@@ -1,0 +1,4 @@
+# local tooling
+.venv/
+__pycache__/
+*.pyc

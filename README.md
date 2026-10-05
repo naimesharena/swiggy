@@ -51,6 +51,7 @@ workbooks built from them.
 | TCS u/s 52 | Nil (not applicable to Sec 9(5) supplies) |
 | TDS u/s 194-O | ₹46.14 (0.1% of item total) |
 | Gross collected from customers | ₹48,548.27 |
+| GST on the un-compensated 20% (deducted, not payable) | ₹5.90 |
 | **Net payouts credited by Swiggy** | **₹30,139.91** |
 
 ## The 80% cancellation-compensation policy (explains the GST difference)
@@ -59,24 +60,42 @@ When an order is cancelled before pickup and the restaurant is not at fault, Swi
 restaurant at **80% of the order value** — so the restaurant is taxed on that compensation, not on the
 full value the customer paid. For order `247576408124202` (01–05 Sep cycle):
 
-| Basis | Value |
-|---|---|
-| Net bill value of the order | ₹590.00 |
-| Compensation value (80%) — the GST-reportable value | ₹472.00 |
-| GST u/s 9(5) discharged (5% × ₹472.00) | **₹23.60** ✓ matches the annexure |
-| TDS u/s 194-O (0.1% × ₹472.00) | ₹0.47 ✓ matches the annexure |
-| Commission charged on (80% × ₹619.50 paid by customer) | ₹495.60 ✓ matches the annexure |
-| Un-compensated 20% → "Customer Cancellations" | ₹123.90 ✓ matches the annexure |
+| Basis | Value | GST @5% | Total |
+|---|---|---|---|
+| Net bill value of the order | ₹590.00 | ₹29.50 | ₹619.50 paid by the customer |
+| **Compensation side** — 80% | ₹472.00 | ₹23.60 | ₹495.60 credited |
+| **Un-compensated side** — 20% | ₹118.00 | ₹5.90 | **₹123.90 deducted** |
+
+Every rupee closes, three ways:
+
+- **Value:** ₹472.00 + ₹118.00 = ₹590.00 = net bill value
+- **Cash:** ₹495.60 + ₹123.90 = ₹619.50 = what the customer paid
+- **GST:** ₹23.60 discharged u/s 9(5) + ₹5.90 not payable = ₹29.50 = GST collected
+
+The ₹123.90 appears in the annexure as *"Customer Cancellations"* / *"Complaint & Cancellation Charges
+[18+19]"* — it is the **GST-inclusive** un-compensated 20% (₹118.00 + 5% = ₹123.90). Each annexure column
+then ties to the policy:
+
+| Annexure column | Value | Derivation |
+|---|---|---|
+| GST Deduction (u/s 9(5)) | ₹23.60 | 5% × ₹472.00 (the compensation value) |
+| Commission charged on | ₹495.60 | 80% × ₹619.50 |
+| Customer Cancellations / Complaint & Cancellation [18+19] | ₹123.90 | ₹118.00 × 1.05 |
+| TDS u/s 194-O | ₹0.47 | 0.1% × ₹472.00 |
 
 Applied to the whole month: ₹46,236.33 billed − ₹118.00 (the un-compensated 20%) = **₹46,118.33** × 5% =
 **₹2,305.92**, which is exactly the GST Swiggy discharged. The ₹6.02 difference between the GST billed to
 customers and the GST discharged is therefore fully explained — **₹5.90 policy + ₹0.12 paise rounding** — and
-nothing needs to be recovered from Swiggy. Orders cancelled *by the restaurant* get no compensation and carry
-no GST at all, only the cancellation charge (see the two MERCHANT-cancelled orders).
+nothing needs to be recovered from Swiggy.
+
+Orders cancelled **by the restaurant** are the opposite case: no compensation and no supply, so no GST arises
+on the food at all — only the cancellation charge, which is quoted *exclusive* of GST with 18% added on top
+(₹82.50 + ₹14.86 and ₹252.25 + ₹45.40, both recovered through "Total Swiggy Fees").
 
 Both workbooks and the CSV carry this logic: a `GST-reportable value` column (80% for a compensated
-cancellation, full value otherwise), a dedicated **Cancelled Orders** sheet in the consolidation report, and a
-compensation-adjusted Section 9(5) reconciliation in the GST working.
+cancellation, full value otherwise), a dedicated **Cancelled Orders** sheet in the consolidation report
+(section A compensated orders, section B restaurant-cancelled orders, section C annexure-column mapping,
+section D month effect), and a compensation-adjusted Section 9(5) reconciliation in the GST working.
 
 ## Things worth acting on
 

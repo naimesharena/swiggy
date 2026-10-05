@@ -832,108 +832,169 @@ def build_consolidated(records, rollups, totals, path):
 
     # ---------------- Cancelled orders & compensation -------------------------
     ws = wb.create_sheet("Cancelled Orders")
-    r = write_title(ws, 1, "Cancelled orders & the 80% compensation policy",
-                    "How a pre-pickup cancellation changes the value on which GST and TDS are computed")
+    r = write_title(ws, 1, "Cancelled orders — the 80% compensation policy",
+                    "Every rupee of a pre-pickup cancellation accounted for: value, GST and the deduction")
     r += 1
     for line in [
         "Swiggy's policy: \"Order cancelled before pickup — as per policy, you will be paid 80% less commissions as compensation.\"",
-        "The restaurant is therefore taxed on the 80% compensation, not on the full value the customer had paid. Derived basis:",
-        "        compensation value (pre-tax) = 80% × net bill value      →  590.00 × 80% = 472.00",
-        "        GST discharged u/s 9(5)      = 5% × compensation value  →  472.00 × 5% = 23.60",
-        "        TDS u/s 194-O                = 0.1% × compensation value→  472.00 × 0.1% = 0.47",
-        "        commission / collection      = charged on 80% × amount paid by customer  →  619.50 × 80% = 495.60",
-        "        un-compensated 20%           = 619.50 × 20% = 123.90   →  reported as 'Customer Cancellations'",
-        "An order cancelled BY THE RESTAURANT earns no compensation: no supply, no GST, only the cancellation charge.",
+        "The restaurant is taxed on the 80% compensation, not on the full value the customer had paid, and the un-compensated 20%",
+        "is deducted from the payout as a GST-inclusive amount. For order 247576408124202 (net bill value ₹590.00):",
+        "        compensation  80% × 590.00 = 472.00   + GST 5% 23.60  =  495.60  → credited (commission is charged on this)",
+        "        un-compensated 20% × 590.00 = 118.00  + GST 5%  5.90  =  123.90  → 'Complaint & Cancellation Charges [18+19]'",
+        "        ---------------------------------------------------------------------------------------------------------",
+        "        net bill value 590.00 + GST 29.50 = 619.50 paid by the customer = 495.60 + 123.90",
     ]:
         cell = ws.cell(r, 1, line)
-        cell.font = NORM
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=8)
+        cell.font = NORM if line.startswith("        ") else BOLD
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=10)
         r += 1
     r += 1
-    headers = ["Payout period", "Order ID", "Order date", "Cancelled by", "Pickup status",
-               "Cancel time (min)", "Order value (net bill)", "GST collected",
-               "Paid by customer", "Compensation %", "Compensation value (pre-tax)",
-               "Compensation incl. GST", "GST @5% on compensation",
-               "GST deducted per annexure", "Difference", "TDS @0.1% on compensation",
-               "TDS per annexure", "Restaurant cancellation charge", "Basis"]
-    widths = [16, 17, 18, 12, 13, 11, 13, 11, 12, 11, 15, 14, 14, 14, 10, 14, 11, 14, 60]
+
+    # ---- A. compensated pre-pickup cancellations -------------------------
+    ws.cell(r, 1, "A.  Cancelled before pickup (not by the restaurant) — compensated at 80%").font = SEC_FONT
+    r += 1
+    headers = ["Payout period", "Order ID", "Cancelled by", "Net bill value", "GST collected",
+               "Paid by customer", "Compensation 80% (pre-tax)", "GST @5% on compensation",
+               "Compensation received (incl. GST)", "Un-compensated 20% (pre-tax)",
+               "GST @5% on the un-compensated 20%",
+               "Complaint & cancellation charges deducted (GST-inclusive)", "Per annexure",
+               "Difference", "Check: compensation + deduction = paid by customer",
+               "TDS @0.1% on compensation", "TDS per annexure"]
+    widths = [16, 17, 12, 12, 11, 12, 14, 13, 15, 14, 15, 17, 12, 10, 15, 13, 12]
     r = write_header(ws, r, headers, widths)
-    tot = {}
     any_comp = False
     for rec in records:
-        for o in [x for x in rec["orders"] if str(x["Order Status"]).lower() == "cancelled"]:
-            comp = is_compensated_cancel(o)
+        for o in [x for x in rec["orders"] if is_compensated_cancel(x)]:
+            any_comp = True
             billed = order_billed_value(o)
-            rep = order_reportable_value(o)
+            gst_o = num(o["GST Collected"])
             paid = num(o["Total Customer Paid [4+5]"])
-            gst_annex = num(o["GST Deduction [Sec 9(5)]"])
-            tds_annex = num(o["TDS"])
-            pct = CANCELLATION_COMPENSATION_RATE if comp else 0.0
-            gst_calc = r2(rep * 0.05) if comp else 0.0
-            tds_calc = r2(rep * 0.001) if comp else 0.0
-            if comp:
-                any_comp = True
-                basis = ("Cancelled by {} before pickup — compensated at 80% of the order value; "
-                         "GST and TDS computed on the compensation value".format(
-                             str(o["Cancelled By?"] or "").title()))
-            else:
-                basis = ("Cancelled by {} — no compensation and no supply; only the restaurant "
-                         "cancellation charge and GST on Swiggy's fee apply".format(
-                             str(o["Cancelled By?"] or "").title()))
-            cancel_min = num(o["Cancellation time"])
-            vals = [rec["label"], str(o["Order ID"]), o["_order_dt"], o["Cancelled By?"],
-                    o["Pick Up Status"], cancel_min, billed, num(o["GST Collected"]), paid,
-                    pct, rep if comp else 0.0, r2(paid * pct), gst_calc,
-                    gst_annex, r2(gst_calc - gst_annex), tds_calc, tds_annex,
-                    num(o["Restaurant Cancellation Charges"]), basis]
+            comp_pre = order_reportable_value(o)
+            gst_comp = r2(comp_pre * 0.05)
+            comp_gross = r2(paid * CANCELLATION_COMPENSATION_RATE)
+            uncomp = order_compensation_deduction(o)
+            gst_uncomp = r2(uncomp * 0.05)
+            deduction = r2(uncomp + gst_uncomp)
+            annexure_ccc = num(o["Complaint & Cancellation Charges [18+19]"])
+            vals = [rec["label"], str(o["Order ID"]), str(o["Cancelled By?"] or "").title(), billed, gst_o,
+                    paid, comp_pre, gst_comp, comp_gross, uncomp, gst_uncomp, deduction, annexure_ccc,
+                    r2(deduction - annexure_ccc), r2(comp_gross + deduction),
+                    r2(comp_pre * 0.001), num(o["TDS"])]
             for j, v in enumerate(vals, start=1):
                 c = ws.cell(r, j, v)
                 c.font = NORM
                 c.border = BOX
-                c.alignment = Alignment(wrap_text=(j == 19), vertical="top" if j == 19 else "center")
-                if j == 3:
-                    c.number_format = 'dd-mmm-yyyy hh:mm'
-                if j == 6:
-                    c.number_format = NUM2
-                if j == 10:
-                    c.number_format = '0%'
-                if j in (7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18):
+                if j >= 4 and j not in (15,):
                     c.number_format = MONEY
-            ws.row_dimensions[r].height = 30
-            for key, col in (("billed", 7), ("gst_annex", 14), ("gst_calc", 13), ("tds_annex", 17),
-                             ("tds_calc", 16), ("cancel_chg", 18)):
-                tot[key] = r2(tot.get(key, 0.0) + (vals[col - 1] if isinstance(vals[col - 1], float) else 0.0))
+                if j == 15:
+                    c.number_format = MONEY
+                if j == 12:
+                    c.fill = INFO_FILL
+            ws.row_dimensions[r].height = 26
             r += 1
-    vals = ["ALL CANCELLED ORDERS", None, None, None, None, None, tot.get("billed", 0.0), None,
-            None, None, None, None, tot.get("gst_calc", 0.0), tot.get("gst_annex", 0.0),
-            r2(tot.get("gst_calc", 0.0) - tot.get("gst_annex", 0.0)), tot.get("tds_calc", 0.0),
-            tot.get("tds_annex", 0.0), tot.get("cancel_chg", 0.0), ""]
-    for j, v in enumerate(vals, start=1):
-        c = ws.cell(r, j, v)
-        c.font = BOLD
-        c.fill = GREEN_FILL
-        c.border = BOX
-        if j in (7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18):
-            c.number_format = MONEY
+    if not any_comp:
+        ws.cell(r, 2, "No compensated cancellations in the period").font = NORM
+        r += 1
+    r += 1
+
+    # ---- B. merchant cancellations ---------------------------------------
+    ws.cell(r, 1, "B.  Cancelled by the restaurant — no compensation, no supply, no GST on the food").font = SEC_FONT
+    r += 1
+    headers = ["Payout period", "Order ID", "Restaurant cancellation charge (excl. GST)",
+               "GST @18% on the charge", "Total recovered by Swiggy",
+               "GST discharged u/s 9(5) on the food", "Net payout", "Remark"]
+    widths_b = [16, 17, 18, 13, 15, 17, 12, 46]
+    r = write_header(ws, r, headers, widths_b)
+    any_merchant = False
+    for rec in records:
+        for o in [x for x in rec["orders"] if str(x["Order Status"]).lower() == "cancelled"
+                  and not is_compensated_cancel(x)]:
+            any_merchant = True
+            charge = num(o["Restaurant Cancellation Charges"])
+            gst_fee = num(o["GST on Service Fee @18%"])
+            vals = [rec["label"], str(o["Order ID"]), charge, gst_fee, r2(charge + gst_fee),
+                    num(o["GST Deduction [Sec 9(5)]"]), num(o["Net Payout for Order (after taxes)"]),
+                    "No supply — the restaurant keeps nothing and pays the cancellation charge; "
+                    "no GST arises on the food"]
+            for j, v in enumerate(vals, start=1):
+                c = ws.cell(r, j, v)
+                c.font = NORM
+                c.border = BOX
+                c.alignment = Alignment(wrap_text=(j == 8), vertical="top" if j == 8 else "center")
+                if 3 <= j <= 7:
+                    c.number_format = MONEY
+            ws.row_dimensions[r].height = 26
+            r += 1
+    if not any_merchant:
+        ws.cell(r, 2, "No restaurant-cancelled orders in the period").font = NORM
+        r += 1
     r += 2
-    ws.cell(r, 1, "Effect on the month's GST (see the GST working workbook → Sec 9(5) Reconciliation)").font = SEC_FONT
+
+    # ---- C. linking the annexure columns ---------------------------------
+    ws.cell(r, 1, "C.  How this maps to the annexure columns").font = SEC_FONT
+    r += 1
+    r = write_header(ws, r, ["Annexure column", "Value for order 247576408124202", "Meaning"],
+                     [40, 24, 74])
+    for label, value, meaning in [
+        ("Net Bill Value (before taxes) [1+2-3]", "590.00", "Order value, exclusive of GST"),
+        ("GST Collected", "29.50", "5% charged to the customer on ₹590.00"),
+        ("Total Customer Paid [4+5]", "619.50", "What the customer actually paid"),
+        ("Commission charged on", "495.60", "80% × ₹619.50 — commission is charged on the compensation, not the full order"),
+        ("GST Deduction", "23.60", "5% × ₹472.00 — tax discharged u/s 9(5) on the compensation value only"),
+        ("Customer Cancellations / Complaint & Cancellation Charges [18+19]", "123.90",
+         "Un-compensated 20% (₹118.00) + GST @5% on it (₹5.90) — a GST-inclusive deduction"),
+        ("TDS", "0.47", "0.1% × ₹472.00 — TDS on the compensation value only"),
+    ]:
+        for j, v in enumerate([label, value, meaning], start=1):
+            c = ws.cell(r, j, v)
+            c.font = NORM
+            c.border = BOX
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[r].height = 28
+        r += 1
+    r += 1
+
+    # ---- D. month effect ---------------------------------------------------
+    ws.cell(r, 1, "D.  Effect on the month's GST").font = SEC_FONT
     r += 1
     billed_month = totals["ol_taxable"]
     adj_month = totals["ol_compensation_deduction"]
     rep_month = totals["ol_reportable"]
-    for line in [
-        "Billed value of all orders                     : ₹{:,.2f}".format(billed_month),
-        "Less: un-compensated 20% of the cancelled order: ₹{:,.2f}".format(adj_month),
-        "GST-reportable value (billed − adjustment)     : ₹{:,.2f}".format(rep_month),
-        "GST @5% on the reportable value                : ₹{:,.2f}".format(r2(rep_month * 0.05)),
-        "GST actually discharged by Swiggy              : ₹{:,.2f}   →  agrees to the paisa".format(
-            abs(totals["ol_gst_9_5"])),
+    rounding_month = r2(totals["gst_collected"] - abs(totals["ol_gst_9_5"]) - adj_month * 0.05)
+    for label, amount, remark in [
+        ("Billed value of all orders", billed_month, "Full value shown to customers"),
+        ("Less: un-compensated 20% of the cancelled order (pre-tax)", -adj_month,
+         "₹590.00 × 20% — the value is not a supply because the restaurant was compensated at 80%"),
+        ("GST-reportable value", rep_month, "Value on which the 5% GST is discharged u/s 9(5)"),
+        ("GST discharged by Swiggy", abs(totals["ol_gst_9_5"]), "= 5% × the reportable value — agrees to the paisa"),
+        ("GST collected from customers on the full billed value", totals["gst_collected"],
+         "5% × ₹{:,.2f}".format(billed_month)),
+        ("Less: GST on the un-compensated 20%, deducted inside the ₹{:,.2f} cancellation charge".format(
+            r2(adj_month * 1.05)), r2(-adj_month * 0.05),
+         "₹118.00 × 5% — this GST is not payable and is deducted from the payout along with the value"),
+        ("Less: paise rounding inside the annexures", -rounding_month,
+         "Each order's GST is rounded to the nearest paisa"),
+        ("GST discharged by Swiggy — after the two adjustments above", abs(totals["ol_gst_9_5"]),
+         "Ties the total GST billed to customers to the total GST discharged"),
     ]:
-        ws.cell(r, 1, line).font = BOLD if ("reportable value (" in line or "actually" in line) else NORM
+        is_total = label.startswith(("GST-reportable value", "GST discharged by Swiggy —"))
+        c1 = ws.cell(r, 1, label)
+        c1.font = BOLD if is_total else NORM
+        c2 = ws.cell(r, 2, amount)
+        c2.font = BOLD if is_total else NORM
+        c2.number_format = MONEY
+        c3 = ws.cell(r, 3, remark)
+        c3.font = NORM
+        c3.alignment = Alignment(wrap_text=True, vertical="top")
+        for j in range(1, 4):
+            ws.cell(r, j).border = BOX
+            if is_total:
+                ws.cell(r, j).fill = GREEN_FILL
+        ws.row_dimensions[r].height = 28
         r += 1
-    stamp(ws, "Policy basis: Swiggy compensates a pre-pickup cancellation (not caused by the restaurant) at 80% of the "
-              "order value; GST u/s 9(5) and TDS u/s 194-O are computed on that compensation value. "
-              "Figures verified order by order against the annexures.")
+    stamp(ws, "Policy basis: Swiggy compensates a pre-pickup cancellation (not caused by the restaurant) at 80% of the order "
+              "value; GST u/s 9(5) and TDS u/s 194-O are computed on that compensation value, and the un-compensated 20% is "
+              "deducted inclusive of its 5% GST. Verified order by order against the annexures.")
 
     # ---------------- Ads & Adjustments -------------------------------------
     ws = wb.create_sheet("Ads & Adjustments")
@@ -1127,6 +1188,45 @@ def build_consolidated(records, rollups, totals, path):
             if abs(diff) > 0.05:
                 bad += 1
                 worst = max(worst, abs(diff))
+    # --- cancellation-policy closure checks (per compensated order) ---
+    for rec in records:
+        for o in [x for x in rec["orders"] if is_compensated_cancel(x)]:
+            billed = order_billed_value(o)
+            paid = num(o["Total Customer Paid [4+5]"])
+            comp_pre = order_reportable_value(o)
+            comp_gross = r2(paid * CANCELLATION_COMPENSATION_RATE)
+            uncomp = order_compensation_deduction(o)
+            deduction = r2(uncomp * 1.05)
+            tag = "{} · {}".format(rec["label"], str(o["Order ID"]))
+            checks.append(("Compensation + un-compensated deduction = amount paid by the customer",
+                           tag, paid, r2(comp_gross + deduction), r2(comp_gross + deduction - paid),
+                           _st(comp_gross + deduction, paid)))
+            checks.append(("Compensation + un-compensated value = net bill value",
+                           tag, billed, r2(comp_pre + uncomp), r2(comp_pre + uncomp - billed),
+                           _st(comp_pre + uncomp, billed)))
+            checks.append(("Complaint & cancellation charges = 20% of net bill value + 5% GST "
+                           "(₹{:.2f} × 1.05)".format(uncomp), tag,
+                           num(o["Complaint & Cancellation Charges [18+19]"]), deduction,
+                           r2(deduction - num(o["Complaint & Cancellation Charges [18+19]"])),
+                           _st(deduction, num(o["Complaint & Cancellation Charges [18+19]"]))))
+            checks.append(("GST collected = GST discharged + GST on the un-compensated 20%",
+                           tag, num(o["GST Collected"]), r2(num(o["GST Deduction [Sec 9(5)]"]) + uncomp * 0.05),
+                           r2(num(o["GST Collected"]) - num(o["GST Deduction [Sec 9(5)]"]) - uncomp * 0.05),
+                           _st(num(o["GST Collected"]),
+                               num(o["GST Deduction [Sec 9(5)]"]) + uncomp * 0.05, tol=0.02)))
+    for rec in records:
+        for o in [x for x in rec["orders"] if str(x["Order Status"]).lower() == "cancelled"
+                  and not is_compensated_cancel(x)]:
+            checks.append(("Restaurant-cancelled order: no supply, no GST discharged on the food",
+                           "{} · {}".format(rec["label"], str(o["Order ID"])), 0.0,
+                           abs(num(o["GST Deduction [Sec 9(5)]"])),
+                           abs(num(o["GST Deduction [Sec 9(5)]"])),
+                           "OK" if abs(num(o["GST Deduction [Sec 9(5)]"])) < 0.01 else "REVIEW"))
+    checks.append(("Month: complaint & cancellation charges (payout line C) = un-compensated 20% + 5% GST",
+                   "All cycles", r2(totals["ol_compensation_deduction"] * 1.05),
+                   abs(totals["complaints_cancel"]),
+                   r2(abs(totals["complaints_cancel"]) - totals["ol_compensation_deduction"] * 1.05),
+                   _st(abs(totals["complaints_cancel"]), totals["ol_compensation_deduction"] * 1.05)))
     checks.append(("Month: GST discharged = 5% of compensation-adjusted reportable value", "All cycles",
                    r2(totals["ol_reportable"] * 0.05), abs(totals["ol_gst_9_5"]),
                    r2(abs(totals["ol_gst_9_5"]) - totals["ol_reportable"] * 0.05),
@@ -1433,10 +1533,14 @@ def build_gst_working(records, rollups, totals, path):
     snap("C.  GST discharged by Swiggy under Section 9(5)", gst_retained,
          "Retained by Swiggy from the payouts and deposited with the Government on your behalf", bold=True)
     snap("        GST collected from customers on the full billed value (memo)", gst_collected,
-         "₹{:,.2f} higher than the amount discharged: ₹{:,.2f} is the cancellation-compensation policy "
-         "(on the 20% not compensated) and ₹{:,.2f} is paise rounding on the other orders — both explained, "
-         "nothing to recover".format(
-             r2(gst_collected - gst_retained), r2(compensation_adj * 0.05), rounding_diff))
+         "Fully accounted for: ₹{:,.2f} discharged u/s 9(5) + ₹{:,.2f} GST on the un-compensated 20% (deducted "
+         "inside the ₹{:,.2f} cancellation charge) + ₹{:,.2f} paise rounding".format(
+             gst_retained, r2(compensation_adj * 0.05), r2(compensation_adj * 1.05), rounding_diff))
+    snap("        Complaint & cancellation charges deducted (line C)", r2(compensation_adj * 1.05),
+         "= un-compensated 20% of the cancelled order (₹{:,.2f}) + GST @5% on it (₹{:,.2f}) — the deduction is "
+         "GST-inclusive".format(compensation_adj, r2(compensation_adj * 0.05)))
+    snap("        GST on the un-compensated 20% — not payable", r2(compensation_adj * 0.05),
+         "₹118.00 × 5%; not a supply, so the tax is not payable and comes back through the cancellation deduction")
     r += 1
     snap("Memorandum items", None, "", money=False, fill=SEC_FILL)
     snap("        GST charged by Swiggy on its own service fee @18%", gst_on_fees,
@@ -1739,35 +1843,38 @@ def build_gst_working(records, rollups, totals, path):
         cell = ws.cell(r, 1, line)
         cell.font = NORM
         cell.alignment = Alignment(wrap_text=True, vertical="top")
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=5)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=8)
         ws.row_dimensions[r].height = 30
         r += 1
     r += 1
-    r = write_header(ws, r, ["Payout period", "Billed value", "Cancellation adjustment",
+    r = write_header(ws, r, ["Payout period", "Billed value", "Cancellation adjustment (value)",
+                             "GST on the un-compensated 20%", "Complaint & cancellation charges deducted",
                              "GST on reportable value", "GST discharged by Swiggy",
-                             "Remark"], [18, 14, 15, 15, 16, 44])
+                             "Remark"], [18, 14, 15, 15, 16, 15, 16, 40])
     for pr in rollups:
         gst_rep = r2(pr["ol_reportable"] * 0.05)
         diff = r2(gst_rep - abs(pr["ol_gst_9_5"]))
         remark = "Agrees to the paisa" if abs(diff) < 0.005 else "Paise rounding (₹{:,.2f})".format(abs(diff))
-        for j, v in enumerate([pr["label"], pr["ol_taxable"], -pr["ol_compensation_deduction"], gst_rep,
-                               abs(pr["ol_gst_9_5"]), remark], start=1):
+        adj = pr["ol_compensation_deduction"]
+        for j, v in enumerate([pr["label"], pr["ol_taxable"], -adj, r2(adj * 0.05), r2(adj * 1.05),
+                               gst_rep, abs(pr["ol_gst_9_5"]), remark], start=1):
             c = ws.cell(r, j, v)
             c.font = NORM
             c.border = BOX
-            if j in (2, 3, 4, 5):
+            if 2 <= j <= 7:
                 c.number_format = MONEY
-            if j == 3 and abs(pr["ol_compensation_deduction"]) > 0.01:
+            if j in (3, 4, 5) and abs(adj) > 0.01:
                 c.fill = INFO_FILL
         ws.row_dimensions[r].height = 24
         r += 1
-    for j, v in enumerate(["TOTAL", taxable, -compensation_adj, gst_reportable, gst_retained,
+    for j, v in enumerate(["TOTAL", taxable, -compensation_adj, r2(compensation_adj * 0.05),
+                           r2(compensation_adj * 1.05), gst_reportable, gst_retained,
                            "GST discharged = 5% × reportable value"], start=1):
         c = ws.cell(r, j, v)
         c.font = BOLD
         c.fill = GREEN_FILL
         c.border = BOX
-        if j in (2, 3, 4, 5):
+        if 2 <= j <= 7:
             c.number_format = MONEY
     r += 2
     ws.cell(r, 1, "Reconciliation of the difference between GST billed to customers and GST discharged").font = SEC_FONT
@@ -1777,8 +1884,9 @@ def build_gst_working(records, rollups, totals, path):
         ("GST collected from customers on the billed value", gst_collected,
          "5% charged on the full value of every order, as shown to the customer"),
         ("Less: GST on the un-compensated 20% of the cancelled order", r2(-compensation_adj * 0.05),
-         "Order 247576408124202 — ₹118.00 × 5% = ₹5.90 of GST was collected but not required to be "
-         "discharged, because the restaurant was compensated at 80% of the order value"),
+         "Order 247576408124202 — ₹118.00 × 5% = ₹5.90. This GST is not payable (the 20% is not a supply) and "
+         "is deducted from the payout inside the ₹{:,.2f} 'Complaint & Cancellation Charges' amount".format(
+             r2(compensation_adj * 1.05))),
         ("Less: paise rounding on the individual orders", -rounding_diff,
          "Each order's GST is rounded to the nearest paisa in the annexure (roughly ₹0.01 on 13 orders)"),
         ("GST discharged by Swiggy (per the annexures)", gst_retained,

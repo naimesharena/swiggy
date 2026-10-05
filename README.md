@@ -1,16 +1,24 @@
 # Swiggy payout annexures — consolidation & GST return working
 
-This folder holds the weekly Swiggy payout annexures for **Cheesecake Mills, Vesu, Surat**
-(Restaurant ID 544662, GSTIN 24AAQFC3084Q1ZT) for **01–30 September 2026**, and the two
-workbooks built from them.
+This folder holds the weekly Swiggy payout annexures for **01–30 September 2026** and the
+workbooks built from them, for two outlets of the same brand:
+
+| Annexures | Outlet | Restaurant ID | GSTIN | Orders | Net payout |
+|---|---|---|---|---|---|
+| the five files in this folder | Cheesecake Mills, **Vesu**, Surat | 544662 | 24AAQFC3084Q1ZT | 95 | ₹30,139.91 |
+| the five files in `creamy/` | Cheesecake Mills, **Adajan**, Surat | 833170 | 24GJOPA4594Q1ZE | 78 | ₹25,416.90 |
 
 ## Deliverables (`reports/`)
 
+One folder per outlet, with a small `index.txt` listing what was produced where:
+
 | File | What it is |
 |---|---|
-| `Swiggy_Consolidated_Report.xlsx` | **Consolidated data report** — all 5 payout cycles merged into one data set |
-| `Swiggy_GST_Return_Working.xlsx` | **GST return filing working** — period-wise tax working, GSTR-1/GSTR-3B support, Sec 9(5) and TCS/TDS reconciliation |
-| `Swiggy_Order_Level_All_Periods.csv` | Flat CSV of all 95 orders (for Tally / Excel / BI) |
+| `Cheesecake_Mills_544662/Swiggy_Consolidated_Report.xlsx` | **Consolidated data report** — all 5 payout cycles merged into one data set |
+| `Cheesecake_Mills_544662/Swiggy_GST_Return_Working.xlsx` | **GST return filing working** — period-wise tax working, GSTR-1/GSTR-3B support, Sec 9(5) and TCS/TDS reconciliation |
+| `Cheesecake_Mills_544662/Swiggy_Order_Level_All_Periods.csv` | Flat CSV of all 95 orders (for Tally / Excel / BI) |
+| `Cheesecake_Mills_833170/…` | The same three files for the Adajan outlet (78 orders) |
+| `index.txt` | Which outlet is in which folder, with order counts and net payouts |
 
 ### 1. Consolidation report — sheets
 
@@ -19,7 +27,8 @@ workbooks built from them.
 - **Payout Breakup** — Swiggy's full payout-breakup structure (lines A→G with all sub-lines) side by side for every cycle
 - **Delivered vs Cancelled** — how each cycle's net payout splits between delivered orders, cancelled orders and ads
 - **Order Level (All Periods)** — every order in one filterable table, tagged with its payout cycle (cancelled rows in amber), with a `GST-reportable value` column
-- **Cancelled Orders** — the 80% compensation policy worked order by order, and its effect on the month's GST
+- **Cancelled Orders** — the 80% compensation policy worked order by order, plus restaurant cancellations and cancellations made after pickup, and their effect on the month's GST
+- **Channel Split** — only when the annexures carry more than one platform (Swiggy / Toing): orders, sales and tax by channel
 - **Ads & Adjustments** — growth investments / adjustments deducted at restaurant level
 - **Discounts**, **Complaints** — campaign and complaint buckets reported by Swiggy
 - **Reconciliation** — 81 automated tie-out checks with status and exceptions
@@ -53,6 +62,19 @@ workbooks built from them.
 | Gross collected from customers | ₹48,548.27 |
 | GST on the un-compensated 20% (deducted, not payable) | ₹5.90 |
 | **Net payouts credited by Swiggy** | **₹30,139.91** |
+
+### Headline figures — Cheesecake Mills, Adajan (833170)
+
+| | |
+|---|---|
+| Orders | 78 (76 delivered, 2 cancelled) across 5 payout cycles |
+| Sales channels | Swiggy 77 orders · Toing 1 order (one annexure covers both) |
+| Billed / GST-reportable value | ₹36,567.28 (no compensated pre-pickup cancellation, so no adjustment) |
+| GST discharged by Swiggy u/s 9(5) @5% | ₹1,828.37 (CGST ₹914.18 + SGST ₹914.19) |
+| GST billed to customers | ₹1,828.52 — ₹0.15 paise rounding, no policy difference |
+| TCS u/s 52 | Nil (not applicable to Sec 9(5) supplies) |
+| TDS u/s 194-O | ₹36.63 |
+| **Net payouts credited by Swiggy** | **₹25,416.90** |
 
 ## The 80% cancellation-compensation policy (explains the GST difference)
 
@@ -91,6 +113,17 @@ nothing needs to be recovered from Swiggy.
 Orders cancelled **by the restaurant** are the opposite case: no compensation and no supply, so no GST arises
 on the food at all — only the cancellation charge, which is quoted *exclusive* of GST with 18% added on top
 (₹82.50 + ₹14.86 and ₹252.25 + ₹45.40, both recovered through "Total Swiggy Fees").
+
+A third case appears in the Adajan data: an order cancelled **after it had been picked up** (cancelled by
+Swiggy, but the food was already on its way). The supply stands, so the **full** order value is taxable and the
+5% GST is discharged on it — the 80% pre-pickup compensation does not apply, and no cancellation deduction is
+made. The three cases are separated on the **Cancelled Orders** sheet of the consolidated report:
+
+| Case | Compensation | GST-reportable value | Where |
+|---|---|---|---|
+| Cancelled before pickup, not by the restaurant | 80% of the order value | 80% of the billed value | section A |
+| Cancelled by the restaurant | none | nil on the food (charge + 18% GST only) | section B |
+| Cancelled after pickup | none — the order was delivered | the full billed value | section B2 |
 
 Both workbooks and the CSV carry this logic: a `GST-reportable value` column (80% for a compensated
 cancellation, full value otherwise), a dedicated **Cancelled Orders** sheet in the consolidation report
@@ -162,6 +195,23 @@ python build_reports.py --dir "D:/Swiggy Oct" --all --outdir out # another month
 python build_reports.py invoice_Annexure_*_09092026_*.xlsx       # just one week
 ```
 
+### Two outlets, one command
+
+Running the tool from the project root picks up both outlets' annexures (the five here and the five in
+`creamy/`) and writes one folder per outlet:
+
+```bash
+.venv/bin/python build_reports.py --all
+```
+
+```
+  Cheesecake Mills (544662)   95 orders   net payout Rs 30,139.91   ->  reports/Cheesecake_Mills_544662
+  Cheesecake Mills (833170)   78 orders   net payout Rs 25,416.90   ->  reports/Cheesecake_Mills_833170
+```
+
+Because both outlets trade under the same name, the restaurant ID is added to the folder name so that one
+outlet's reports can never overwrite the other's.
+
 ### Using it for other restaurants
 
 The tool does not hard-code this restaurant. For every file it reads the identity from the **Summary** sheet
@@ -170,7 +220,7 @@ The tool does not hard-code this restaurant. For every file it reads the identit
 from the annexure data (falling back to 5%). Nothing else is assumed.
 
 - One restaurant selected → outputs go straight into `reports/` (as here).
-- Several restaurants selected → each gets its own folder `reports/<Restaurant_Name>/`, plus a small
+- Several restaurants selected → each gets its own folder `reports/<Restaurant_Name>_<ID>/`, plus a small
   `reports/index.txt` listing what was produced where.
 - The GSTIN's state code drives the state name and place of supply on every sheet (Gujarat 24, Maharashtra 27 …),
   so an outlet in another state is labelled correctly without any code change.
@@ -181,6 +231,16 @@ from the annexure data (falling back to 5%). Nothing else is assumed.
 - The same annexure kept in two folders (for example `creamy/` and the project root) is detected as a
   duplicate and read **once**, so totals are never double-counted. Duplicates are shown in the file list as
   `duplicate of #N`, and reported when the run starts.
+- The **Payout Breakup** sheet is read by its column headings, not by fixed columns. Some annexures print a
+  single Delivered / Cancelled / Total block; the newer ones print one block **per sales channel**
+  (Swiggy and Toing) followed by a Total column. Both shapes are summed into the same figures, and a
+  **Channel Split** sheet is added to the consolidated report when more than one channel is present.
+- The **Summary** sheet is read with the tightest label match, so a file that lists "Total orders on Swiggy",
+  "Total orders on Toing" *and* "Total Orders (Delivered + Cancelled)" reports the combined count, not the
+  Swiggy-only one.
+- Cancellations are classified three ways — compensated before pickup (80%), cancelled by the restaurant
+  (no supply), and cancelled after pickup (supply stands, full value taxed) — instead of assuming every
+  non-compensated cancellation was the restaurant's.
 - A file that cannot be read is reported (with the missing sheets) and skipped; the other restaurants are
   still processed.
 

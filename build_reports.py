@@ -187,17 +187,36 @@ MONTH_ABBR = {"january": "Jan", "february": "Feb", "march": "Mar", "april": "Apr
 MERCHANT_CANCEL_WORDS = ("MERCHANT", "RESTAURANT", "OUTLET", "SELF")
 
 
-def is_compensated_cancel(order):
-    """True when the restaurant is compensated for a pre-pickup cancellation."""
+def cancel_category(order):
+    """How a cancelled order is treated: 'merchant', 'after_pickup', 'compensated' or ''.
+
+    - merchant     : cancelled by the restaurant -> no supply, no GST on the food
+                     (only the cancellation charge, quoted exclusive of GST);
+    - after_pickup : cancelled once the food had been picked up -> the supply
+                     happened, so the full value is taxable and the GST is due;
+    - compensated : cancelled before pickup by the customer/Swiggy -> the
+                     restaurant is paid 80% of the order value and that is what
+                     is taxed (the un-compensated 20% is not a supply).
+    """
     if str(order.get("Order Status") or "").strip().lower() != "cancelled":
-        return False
+        return ""
     by = str(order.get("Cancelled By?") or "").strip().upper()
     if any(word in by for word in MERCHANT_CANCEL_WORDS):
-        return False
+        return "merchant"
     pickup = str(order.get("Pick Up Status") or "").strip().lower()
     if "picked" in pickup and "not" not in pickup:
-        return False
-    return True
+        return "after_pickup"
+    return "compensated"
+
+
+def is_compensated_cancel(order):
+    """True when the restaurant is compensated for a pre-pickup cancellation."""
+    return cancel_category(order) == "compensated"
+
+
+def is_after_pickup_cancel(order):
+    """True when the order was cancelled after pickup - the supply still stands."""
+    return cancel_category(order) == "after_pickup"
 
 
 def order_billed_value(order):
@@ -230,6 +249,18 @@ def safe_slug(text, fallback="restaurant"):
     return (slug[:60] or fallback)
 
 
+def group_folder_name(first, key):
+    """Folder name for one restaurant: 'Name_544662'.
+
+    Two outlets can trade under the same brand (here both are 'Cheesecake
+    Mills'), so the restaurant id - or the GSTIN when there is no id - is
+    always added to keep each outlet's reports in their own folder.
+    """
+    name = first.get("restaurant") or first.get("rest_id") or "Restaurant"
+    suffix = str(first.get("rest_id") or first.get("gstin") or key or "").strip()
+    return "{} {}".format(name, suffix).strip() if suffix else str(name)
+
+
 def state_name(gstin):
     """'24AAQFC3084Q1ZT' -> 'Gujarat' (falls back to 'state 24')."""
     gstin = str(gstin or "")
@@ -257,6 +288,8 @@ def find_sheet(wb, *candidates):
 
 def looks_like_annexure(path):
     """True when the workbook has the sheets a Swiggy payout annexure must have."""
+    if str(path).lower().endswith(".xls"):
+        return False, ("old .xls format - open it in Excel and save as .xlsx, then try again")
     try:
         wb = openpyxl.load_workbook(path, read_only=True)
     except Exception:
@@ -366,8 +399,10 @@ def num(value):
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
-    text = str(value).replace("₹", "").replace(",", "").replace("%", "").strip()
-    if text in ("", "-", "NA", "N/A"):
+    text = str(value).strip()
+    text = re.sub(r"(?i)^(₹|rs\.?|inr)\s*", "", text)   # 'Rs. 1,234.56' -> '1,234.56'
+    text = text.replace("₹", "").replace(",", "").replace("%", "").replace(" ", "")
+    if text in ("", "-", "--", "NA", "N/A"):
         return 0.0
     try:
         return float(text)
@@ -546,6 +581,40 @@ def map_order_columns(ws):
     return header_row, mapping, missing
 
 
+def detect_payout_layout(ws):
+    """Locate the delivered / cancelled / total columns of the Payout Breakup.
+
+    Annexures arrive in two shapes:
+
+        single block      D Delivered | E Cancelled | F Total
+        two channels      D Swiggy delivered | E Swiggy cancelled
+                          F Toing delivered  | G Toing cancelled | H Total
+
+    so the columns are read from the header rows instead of being assumed. The
+    channel blocks are summed, which keeps one-channel and two-channel
+    annexures on the same footing. Returns (first data row, delivered columns,
+    cancelled columns, total column).
+    """
+    delivered, cancelled, total_col, header_row = [], [], None, None
+    for r in range(1, 13):
+        for c in range(1, min(ws.max_column, 16) + 1):
+            v = ws.cell(r, c).value
+            if not isinstance(v, str):
+                continue
+            text = re.sub(r"\s+", " ", v).strip().lower()
+            if text.startswith(("delivered", "canceled", "cancelled")):
+                (cancelled if text.startswith(("cancel", "canceled")) else delivered).append(c)
+                header_row = max(header_row or 0, r)
+            elif text == "total":
+                total_col = c
+                header_row = max(header_row or 0, r)
+    if not delivered or not cancelled:
+        raise ValueError("Payout Breakup sheet has no Delivered/Cancelled column headings")
+    # the row under the headings is the Orders count, then the money lines
+    data_start = (header_row or 5) + 2
+    return data_start, sorted(set(delivered)), sorted(set(cancelled)), total_col
+
+
 def read_annexure(path):
     wb = openpyxl.load_workbook(path, data_only=True)
     rec = {"file": os.path.basename(path), "path": path}
@@ -572,27 +641,39 @@ def read_annexure(path):
     ws = find_sheet(wb, "Payout Breakup", "Payout breakup")
     if ws is None:
         raise ValueError("no 'Payout Breakup' sheet")
+    data_start, delivered_cols, cancelled_cols, total_col = detect_payout_layout(ws)
+    rec["payout_columns"] = {"delivered": delivered_cols, "cancelled": cancelled_cols,
+                             "total": total_col}
     lines = {}
     ads_lines = []
     mode = None
-    for row in ws.iter_rows(min_row=5, max_row=50):
+
+    def cell_value(row, col):
+        return row[col - 1].value if col and col <= len(row) else None
+
+    def sum_cols(row, cols):
+        return r2(sum(num(cell_value(row, c)) for c in cols))
+
+    for row in ws.iter_rows(min_row=data_start, max_row=data_start + 60):
         code = row[1].value
         label = row[2].value
         code_str = PAYOUT_CANON.get(_norm_code(code))
         if code_str in PAYOUT_LINES:
             mode = code_str
+            delivered = sum_cols(row, delivered_cols)
+            cancelled = sum_cols(row, cancelled_cols)
+            total = num(cell_value(row, total_col)) if total_col else r2(delivered + cancelled)
             lines[code_str] = {
                 "label": PAYOUT_LINES[code_str],
-                "delivered": num(row[3].value),
-                "cancelled": num(row[4].value),
-                "total": num(row[5].value),
+                "delivered": delivered,
+                "cancelled": cancelled,
+                "total": total,
             }
-        elif mode == "D" and label and code is None and row[5].value is not None:
+        elif mode == "D" and label and code is None and total_col and \
+                cell_value(row, total_col) is not None:
             # Ads sub-lines (Top Picks - Ads, Ads Offers, ...)
             ads_lines.append({"label": str(label).strip().split("\n")[0],
-                              "amount": num(row[5].value)})
-        elif mode == "D" and code_str in PAYOUT_LINES:
-            mode = None
+                              "amount": num(cell_value(row, total_col))})
     rec["payout_lines"] = lines
     rec["ads_lines"] = ads_lines
 
@@ -675,15 +756,50 @@ def read_annexure(path):
 
 
 def _first_match(mapping, needle):
-    """Look up a Summary label loosely ('Total Payout', 'total payout', ...)."""
-    needle = needle.lower()
-    for key, value in mapping.items():
-        if needle in str(key).lower():
-            return value
+    """Look up a Summary label loosely, preferring the tightest match.
+
+    Annexures with a Toing section list 'Total orders on Swiggy (Delivered +
+    Cancelled)' and 'Total orders on Toing (...)' above the combined 'Total
+    Orders (Delivered + Cancelled)', so a plain 'first contains' lookup would
+    return the Swiggy count alone. Exact matches win; then the shortest label.
+    """
+    needle = needle.lower().strip()
+
+    def tidy(text):
+        return re.sub(r"\s+", " ", str(text)).strip().lower()
+
+    keys = [k for k in mapping if tidy(k)]
+    for want in (lambda k: tidy(k) == needle,
+                 lambda k: tidy(k).startswith(needle),
+                 lambda k: needle in tidy(k)):
+        hits = [k for k in keys if want(k)]
+        if hits:
+            return mapping[min(hits, key=lambda k: len(tidy(k)))]
     return None
 
 
 SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "reports", "output", "node_modules"}
+
+
+def find_legacy_excel(folder, recursive=True):
+    """Old-format .xls workbooks (openpyxl cannot read these).
+
+    They are returned so the menu can say what to do with them, and they are
+    skipped when reading.
+    """
+    folder = os.path.abspath(os.path.expanduser(folder))
+    found = glob.glob(os.path.join(folder, "*.xls"))
+    if recursive:
+        found += glob.glob(os.path.join(folder, "**", "*.xls"), recursive=True)
+    unique, seen = [], set()
+    for f in found:
+        if os.path.basename(f).startswith("~$"):
+            continue
+        real = os.path.abspath(f)
+        if real not in seen:
+            seen.add(real)
+            unique.append(real)
+    return unique
 
 
 def find_annexures(folder, recursive=True, skip=None):
@@ -702,6 +818,7 @@ def find_annexures(folder, recursive=True, skip=None):
         found += glob.glob(os.path.join(folder, pattern))
         if recursive:
             found += glob.glob(os.path.join(folder, "**", pattern), recursive=True)
+    found += find_legacy_excel(folder, recursive=recursive)
     cleaned = []
     for f in found:
         if os.path.basename(f).startswith("~$"):
@@ -721,6 +838,11 @@ def find_annexures(folder, recursive=True, skip=None):
     found.sort(key=lambda f: (0 if "annexure" in os.path.basename(f).lower() else 1,
                               os.path.basename(f).lower()))
     return found
+
+
+def has_legacy_excel(folder, recursive=True):
+    """Any .xls workbooks in the folder that openpyxl cannot read?"""
+    return find_legacy_excel(folder, recursive=recursive)
 
 
 def expand_inputs(items, folder=None):
@@ -877,19 +999,65 @@ def period_rollup(rec):
         "ol_gst_on_fees": order_totals(orders, "GST on Service Fee @18%"),
         "ol_gst_9_5": order_totals(orders, "GST Deduction [Sec 9(5)]"),
         "ol_cancellations": order_totals(orders, "Complaint & Cancellation Charges [18+19]"),
+        "channels": channel_split(orders),
     }
+
+
+def channel_split(orders):
+    """Group orders by the platform they came through (Swiggy / Toing / ...)."""
+    channels = OrderedDict()
+    for o in orders:
+        name = str(o.get("Order Category") or "").strip() or "Swiggy"
+        ch = channels.setdefault(name, {"orders": 0, "item_total": 0.0, "gst_collected": 0.0,
+                                        "gst_9_5": 0.0, "tds": 0.0, "net_payout": 0.0,
+                                        "cancelled": 0})
+        ch["orders"] += 1
+        if str(o.get("Order Status") or "").lower() == "cancelled":
+            ch["cancelled"] += 1
+        ch["item_total"] = r2(ch["item_total"] + num(o.get("Item Total")))
+        ch["gst_collected"] = r2(ch["gst_collected"] + num(o.get("GST Collected")))
+        ch["gst_9_5"] = r2(ch["gst_9_5"] + num(o.get("GST Deduction [Sec 9(5)]")))
+        ch["tds"] = r2(ch["tds"] + num(o.get("TDS")))
+        ch["net_payout"] = r2(ch["net_payout"] + num(o.get("Net Payout for Order (after taxes)")))
+    return channels
+
+
+def channel_names(rollups):
+    """Every channel seen across the selected periods, in first-seen order."""
+    names = OrderedDict()
+    for pr in rollups:
+        for name in (pr.get("channels") or {}):
+            names.setdefault(name, True)
+    return list(names)
+
+
+def channel_totals(rollups):
+    """Channel (Swiggy / Toing / ...) totals for the whole selection."""
+    total = OrderedDict()
+    for pr in rollups:
+        for name, ch in (pr.get("channels") or {}).items():
+            acc = total.setdefault(name, {"orders": 0, "cancelled": 0, "item_total": 0.0,
+                                          "gst_collected": 0.0, "gst_9_5": 0.0, "tds": 0.0,
+                                          "net_payout": 0.0})
+            acc["orders"] += ch["orders"]
+            acc["cancelled"] += ch["cancelled"]
+            for key in ("item_total", "gst_collected", "gst_9_5", "tds", "net_payout"):
+                acc[key] = r2(acc[key] + ch[key])
+    return total
 
 
 def policy_facts(records, rollups, totals, gst_rate=None, period_label=None):
     """Everything the narrative sheets need, computed from the data itself."""
     gst_rate = gst_rate or gst_rate_from_data(records)
     compensated = [o for rec in records for o in rec["orders"] if is_compensated_cancel(o)]
-    merchant = [o for rec in records for o in rec["orders"]
-                if str(o["Order Status"]).lower() == "cancelled" and not is_compensated_cancel(o)]
+    merchant = [o for rec in records for o in rec["orders"] if cancel_category(o) == "merchant"]
+    after_pickup = [o for rec in records for o in rec["orders"] if cancel_category(o) == "after_pickup"]
     sample = compensated[0] if compensated else None
     facts = {
         "files": len(records),
         "files_word": number_word(len(records)),
+        "channels": channel_names(rollups),
+        "channel_totals": channel_totals(rollups),
         "start": rollups[0]["start"], "end": rollups[-1]["end"],
         "period_label": period_label or month_label(rollups[0]["start"], rollups[-1]["end"]),
         "span": span_text(rollups[0]["start"], rollups[-1]["end"]),
@@ -906,6 +1074,8 @@ def policy_facts(records, rollups, totals, gst_rate=None, period_label=None):
         "prepared_on": PREPARED_ON,
         "compensated": compensated,
         "merchant_cancels": merchant,
+        "after_pickup": after_pickup,
+        "after_pickup_n": len(after_pickup),
         "sample": sample,
         "comp_value": r2(sum(order_reportable_value(o) for o in compensated)),
         "comp_deduction": totals["ol_compensation_deduction"],
@@ -1069,8 +1239,12 @@ def build_consolidated(records, rollups, totals, path, facts=None):
         ("", ""),
         ("Source files", ""),
     ]
+    if len(facts["channels"]) > 1:
+        rows.insert(7, ("Sales channels", " + ".join(
+            "{} ({} order{})".format(name, ch["orders"], "" if ch["orders"] == 1 else "s")
+            for name, ch in facts["channel_totals"].items())))
     r = 5
-    for label, value in rows:
+    for label, value in [row for row in rows if row]:
         if label:
             ws.cell(r, 2, label).font = BOLD
             ws.cell(r, 3, value).font = NORM
@@ -1235,6 +1409,56 @@ def build_consolidated(records, rollups, totals, path, facts=None):
               "Total net payout = delivered net + cancelled net + ads.")
 
     # ---------------- Delivered vs Cancelled --------------------------------
+    if len(facts["channels"]) > 1:
+        ws = wb.create_sheet("Channel Split")
+        r = write_title(ws, 1, "Sales channels — {} / {}".format(
+            " + ".join(facts["channels"]), first["restaurant"]),
+            "Orders, sales and tax by the platform they came through (Order Category on the Order Level sheet)")
+        r += 1
+        r = write_header(ws, r, ["Channel", "Orders", "Cancelled", "Item total", "GST collected",
+                                 "GST discharged u/s 9(5)", "TDS u/s 194-O", "Net payout (order level)",
+                                 "Remark"], [16, 9, 11, 14, 14, 17, 14, 17, 40])
+        for name, ch in facts["channel_totals"].items():
+            vals = [name, ch["orders"], ch["cancelled"], ch["item_total"], ch["gst_collected"],
+                    ch["gst_9_5"], ch["tds"], ch["net_payout"],
+                    "Tax is retained and discharged by the operator for both channels"]
+            for j, v in enumerate(vals, start=1):
+                c = ws.cell(r, j, v)
+                c.font = NORM
+                c.border = BOX
+                c.alignment = Alignment(vertical="center", wrap_text=(j == 9))
+                if j in (4, 5, 6, 7, 8):
+                    c.number_format = MONEY
+            r += 1
+        tot = facts["channel_totals"]
+        vals = ["TOTAL", sum(c["orders"] for c in tot.values()), sum(c["cancelled"] for c in tot.values()),
+                r2(sum(c["item_total"] for c in tot.values())), r2(sum(c["gst_collected"] for c in tot.values())),
+                r2(sum(c["gst_9_5"] for c in tot.values())), r2(sum(c["tds"] for c in tot.values())),
+                r2(sum(c["net_payout"] for c in tot.values())), ""]
+        for j, v in enumerate(vals, start=1):
+            c = ws.cell(r, j, v)
+            c.font = BOLD
+            c.fill = GREEN_FILL
+            c.border = BOX
+            if j in (4, 5, 6, 7, 8):
+                c.number_format = MONEY
+        r += 2
+        for note in [
+            "The annexure prints one block of columns per channel on the Payout Breakup sheet; both are summed "
+            "here and in every other sheet of this workbook.",
+            "Net payout on this sheet is the order-level figure and excludes restaurant-level ads investment, "
+            "which the annexure deducts once for the month.",
+            "Both channels are ordered through the same e-commerce operator arrangement - the GST is retained "
+            "and deposited from the payout - so the tax working is unchanged by the split.",
+        ]:
+            cell = ws.cell(r, 1, "•  " + note)
+            cell.font = NORM
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=9)
+            ws.row_dimensions[r].height = 28
+            r += 1
+        autosize(ws, min_w=12, max_w=60)
+
     ws = wb.create_sheet("Delivered vs Cancelled")
     r = write_title(ws, 1, "Delivered vs cancelled vs restaurant-level deductions",
                     "How each cycle's net payout is built up")
@@ -1444,8 +1668,7 @@ def build_consolidated(records, rollups, totals, path, facts=None):
     r = write_header(ws, r, headers, widths_b)
     any_merchant = False
     for rec in records:
-        for o in [x for x in rec["orders"] if str(x["Order Status"]).lower() == "cancelled"
-                  and not is_compensated_cancel(x)]:
+        for o in [x for x in rec["orders"] if cancel_category(x) == "merchant"]:
             any_merchant = True
             charge = num(o["Restaurant Cancellation Charges"])
             gst_fee = num(o["GST on Service Fee @18%"])
@@ -1465,7 +1688,47 @@ def build_consolidated(records, rollups, totals, path, facts=None):
     if not any_merchant:
         ws.cell(r, 2, "No restaurant-cancelled orders in the period").font = NORM
         r += 1
-    r += 2
+    r += 1
+
+    # ---- B2. cancelled after pickup - the supply stands -------------------
+    if f["after_pickup_n"]:
+        ws.cell(r, 1, "B2.  Cancelled after pickup — the food was delivered, so the supply stands and GST is due").font = SEC_FONT
+        r += 1
+        r = write_header(ws, r, ["Payout period", "Order ID", "Cancelled by", "Net bill value",
+                                 "GST collected", "GST discharged u/s 9(5)", "TDS", "Net payout",
+                                 "Remark"], [16, 17, 12, 12, 12, 16, 10, 12, 44])
+        for rec in records:
+            for o in [x for x in rec["orders"] if cancel_category(x) == "after_pickup"]:
+                billed = order_billed_value(o)
+                vals = [rec["label"], str(o["Order ID"]), str(o["Cancelled By?"] or "").title(), billed,
+                        num(o["GST Collected"]), num(o["GST Deduction [Sec 9(5)]"]), num(o["TDS"]),
+                        num(o["Net Payout for Order (after taxes)"]),
+                        "The order had already been picked up when it was cancelled, so the restaurant keeps the "
+                        "full value and the tax on it — the 80% pre-pickup compensation does not apply"]
+                for j, v in enumerate(vals, start=1):
+                    c = ws.cell(r, j, v)
+                    c.font = NORM
+                    c.border = BOX
+                    c.alignment = Alignment(wrap_text=(j == 9), vertical="top" if j == 9 else "center")
+                    if 4 <= j <= 8:
+                        c.number_format = MONEY
+                ws.row_dimensions[r].height = 30
+                r += 1
+        r += 1
+        for note in [
+            "The annexure marks these orders 'cancelled' but shows them as picked up, and discharges the full 5% GST "
+            "on the order value — the supply took place, so nothing is adjusted.",
+            "This is different from a cancellation before pickup (compensated at 80%) and from a restaurant "
+            "cancellation (no supply at all).",
+        ]:
+            cell = ws.cell(r, 1, "•  " + note)
+            cell.font = NORM
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=9)
+            ws.row_dimensions[r].height = 28
+            r += 1
+        r += 1
+    r += 1
 
     # ---- C. linking the annexure columns ---------------------------------
     ws.cell(r, 1, "C.  How this maps to the annexure columns").font = SEC_FONT
@@ -1770,13 +2033,18 @@ def build_consolidated(records, rollups, totals, path, facts=None):
                            _st(num(o["GST Collected"]),
                                num(o["GST Deduction [Sec 9(5)]"]) + uncomp * gst_rate, tol=0.02)))
     for rec in records:
-        for o in [x for x in rec["orders"] if str(x["Order Status"]).lower() == "cancelled"
-                  and not is_compensated_cancel(x)]:
+        for o in [x for x in rec["orders"] if cancel_category(x) == "merchant"]:
             checks.append(("Restaurant-cancelled order: no supply, no GST discharged on the food",
                            "{} · {}".format(rec["label"], str(o["Order ID"])), 0.0,
                            abs(num(o["GST Deduction [Sec 9(5)]"])),
                            abs(num(o["GST Deduction [Sec 9(5)]"])),
                            "OK" if abs(num(o["GST Deduction [Sec 9(5)]"])) < 0.01 else "REVIEW"))
+        for o in [x for x in rec["orders"] if is_after_pickup_cancel(x)]:
+            expected = r2(order_billed_value(o) * gst_rate)
+            actual = abs(num(o["GST Deduction [Sec 9(5)]"]))
+            checks.append(("Order cancelled after pickup: the supply stands, so GST is discharged on the full value",
+                           "{} · {}".format(rec["label"], str(o["Order ID"])), expected, actual,
+                           r2(actual - expected), _st(actual, expected, tol=0.02)))
     checks.append(("Month: complaint & cancellation charges (payout line C) = un-compensated {} + {} GST".format(
                        uncomp_pct, rate_pct),
                    f["period_label"], r2(totals["ol_compensation_deduction"] * (1 + gst_rate)),
@@ -2004,6 +2272,11 @@ def build_gst_working(records, rollups, totals, path, facts=None):
         ("Input tax credit", "Not available — restaurant service at 5% is a no-ITC rate"),
         ("Income-tax TDS", "Section 194-O TDS of ₹{:,.2f} was deducted by Swiggy during the month — claim the credit in Form 26AS / AIS".format(tds_total)),
     ]
+    if len(f["channels"]) > 1:
+        info.insert(4, ("Sales channels", " + ".join(
+            "{} ({} order{})".format(name, ch["orders"], "" if ch["orders"] == 1 else "s")
+            for name, ch in f["channel_totals"].items()) +
+            " — one annexure covers every channel, and the tax working combines them"))
     for label, value in info:
         ws.cell(r, 2, label).font = BOLD
         cell = ws.cell(r, 3, value)
@@ -2093,12 +2366,24 @@ def build_gst_working(records, rollups, totals, path, facts=None):
     snap("A.  Supply value billed to customers (all orders)", taxable,
          "Item total + packaging − restaurant-funded discounts, for {} orders".format(int(totals["orders_total"])), bold=True)
     snap("        Delivered orders", totals["ol_taxable_delivered"], "All orders marked 'delivered'")
-    snap("        Cancelled orders (billed value)", totals["ol_taxable_cancelled"],
-         ("{} order(s) cancelled before pickup by {} — {}{}".format(
-             len(f["compensated"]), f.get("sample_cancelled_by", "Swiggy"), f.get("sample_id", ""),
-             f", cancelled in the {f['sample_period']} cycle" if sample else
-             "; no GST is discharged on them (compensation at {})".format(comp_pct))
-          if f["compensated"] else "No cancelled orders in this period"))
+    if f["compensated"]:
+        cancelled_remark = "{} order(s) cancelled before pickup by {} — {}{}".format(
+            len(f["compensated"]), f.get("sample_cancelled_by", "Swiggy"), f.get("sample_id", ""),
+            f", cancelled in the {f['sample_period']} cycle" if sample else
+            "; no GST is discharged on them (compensation at {})".format(comp_pct))
+    elif int(totals["orders_cancelled"]):
+        parts = []
+        if f["merchant_cancels"]:
+            parts.append("{} cancelled by the restaurant — no supply, no GST on the food".format(
+                len(f["merchant_cancels"])))
+        if f.get("after_pickup"):
+            parts.append("{} cancelled after pickup — the supply stands, so the full value is taxed".format(
+                len(f["after_pickup"])))
+        cancelled_remark = "{} cancelled order(s): {}".format(
+            int(totals["orders_cancelled"]), "; ".join(parts) or "the {} compensation does not apply".format(comp_pct))
+    else:
+        cancelled_remark = "No cancelled orders in this period"
+    snap("        Cancelled orders (billed value)", totals["ol_taxable_cancelled"], cancelled_remark)
     snap("    Less: un-compensated {} of the cancelled order".format(uncomp_pct), -compensation_adj,
          ("Swiggy's policy pays the restaurant {comp} of the order value as compensation for a pre-pickup "
           "cancellation, so GST is discharged on ₹{compv:,.2f} ({comp} × ₹{billed:,.2f}), not on "
@@ -2795,8 +3080,15 @@ def build_gst_working(records, rollups, totals, path, facts=None):
         "annexures as evidence if the department asks why no ITC was taken.".format(gst_on_fees, rate_pct),
         "TDS of ₹{:,.2f} under Section 194-O must be reconciled with Form 26AS / AIS and claimed in the income-tax return.".format(tds_total),
         "Cess or state-specific levies on food delivery, if any, are not reflected in these annexures.",
-        "This is a data-preparation workbook, not tax advice — the treatment finally adopted is the responsibility of "
-        "the taxpayer and their CA.",
+        ("This period also includes {}".format(", ".join(
+            "{} {} order{}".format(ch["orders"], name, "" if ch["orders"] == 1 else "s")
+            for name, ch in f["channel_totals"].items() if name.lower() != "swiggy")) +
+         " routed through a second platform in the same annexure. The tax on those orders is also retained and "
+         "deposited by the operator — confirm with your CA that each channel is reported operator-wise in "
+         "GSTR-1 Table 14 against the right operator GSTIN."
+         if len(f["channels"]) > 1 else
+         "This is a data-preparation workbook, not tax advice — the treatment finally adopted is the responsibility "
+         "of the taxpayer and their CA."),
     ]
     for p in points:
         cell = ws.cell(r, 2, "•  " + p)
@@ -2997,9 +3289,13 @@ def choose_files_interactive(folder, skip=None):
     """Interactive menu: pick a folder, then one / several / all annexures."""
     while True:
         paths = find_annexures(folder, skip=skip)
+        legacy = has_legacy_excel(folder)
         _panel("Swiggy annexure report generator",
                ["Folder: {}".format(os.path.abspath(folder)),
                 "Found {} .xlsx file(s) - showing what each one is".format(len(paths))])
+        if legacy:
+            print("\n  Note: {} old .xls file(s) here are not readable by this tool - open them in "
+                  "Excel and save as .xlsx.\n  e.g. {}".format(len(legacy), _short(legacy[0], 60)))
         if not paths:
             print("\n  No .xlsx files in this folder.")
         rows = describe_files(paths)
@@ -3084,6 +3380,10 @@ def main(argv=None):
         paths = expand_inputs([folder])
         rows = describe_files(paths)
         _panel("Annexures found in {}".format(folder))
+        legacy = has_legacy_excel(folder)
+        if legacy:
+            print("  Note: {} old .xls file(s) here are not readable by this tool - open them in "
+                  "Excel and save as .xlsx\n  e.g. {}".format(len(legacy), _short(legacy[0], 70)))
         print_file_table(rows)
         valid = [r for r in rows if r["ok"]]
         dups = [r for r in valid if r.get("dup_of")]
@@ -3138,7 +3438,7 @@ def main(argv=None):
             facts = policy_facts(group_records, rollups, totals, gst_rate=rate)
             first = group_records[0]
             label = "{} ({})".format(first["restaurant"] or "Restaurant", first["rest_id"] or key)
-            target = os.path.join(outdir, safe_slug(first["restaurant"] or first["rest_id"])) if multi else outdir
+            target = os.path.join(outdir, safe_slug(group_folder_name(first, key))) if multi else outdir
             os.makedirs(target, exist_ok=True)
 
             p1 = build_consolidated(group_records, rollups, totals,

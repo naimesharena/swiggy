@@ -1,0 +1,6 @@
+Swiggy annexure reports generated 05 October 2026
+
+Cheesecake Mills (544662) - 5 file(s), 95 orders, net payout Rs 30,139.91
+    /home/user/swiggy/reports/Cheesecake_Mills_544662
+Cheesecake Mills (833170) - 5 file(s), 78 orders, net payout Rs 25,416.90
+    /home/user/swiggy/reports/Cheesecake_Mills_833170
